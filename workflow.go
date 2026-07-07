@@ -356,7 +356,7 @@ func ReadLatestErrorLog(ctx agent.Context, args ReadLogArgs) (ReadLogResult, err
 func CreateStructuredTicket(ctx agent.Context, args CreateTicketArgs) (CreateTicketResult, error) {
 	ticketDir := defaultTicketsDirValue
 	if err := os.MkdirAll(ticketDir, 0o755); err != nil {
-		return CreateTicketResult{Status: "Failed to create ticket directory"}, err
+		return CreateTicketResult{Status: "Failed to create ticket directory"}, fmt.Errorf("create ticket directory %q: %w; verify the tickets directory exists and is writable", ticketDir, err)
 	}
 
 	ticketID := fmt.Sprintf("BUG-%d", time.Now().Unix())
@@ -372,16 +372,38 @@ func CreateStructuredTicket(ctx agent.Context, args CreateTicketArgs) (CreateTic
 
 	payload, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return CreateTicketResult{Status: "Failed to parse ticket data"}, err
+		return CreateTicketResult{Status: "Failed to parse ticket data"}, fmt.Errorf("marshal ticket payload: %w; verify ticket fields are valid", err)
 	}
 
 	filePath := filepath.Join(ticketDir, fmt.Sprintf("%s.json", ticketID))
 	if err := os.WriteFile(filePath, payload, 0o644); err != nil {
-		return CreateTicketResult{Status: "Failed to write ticket file"}, err
+		return CreateTicketResult{Status: "Failed to write ticket file"}, fmt.Errorf("write ticket file %q: %w; verify ticket directory permissions and disk space", filePath, err)
 	}
 
 	slog.Info("tool.call", "tool", "create_structured_ticket", "path", filePath, "ticket_id", ticketID)
 	return CreateTicketResult{Status: fmt.Sprintf("Success: Ticket created with ID %s", ticketID), TicketID: ticketID}, nil
+}
+
+// buildReadLatestErrorLogTool constructs the ADK tool that reads the latest local error log.
+func buildReadLatestErrorLogTool() (tool.Tool, error) {
+	return functiontool.New(functiontool.Config{
+		Name:        "read_latest_error_log",
+		Description: "Read the latest redacted error log from the local logs directory.",
+	}, ReadLatestErrorLog)
+}
+
+// buildCreateStructuredTicketTool constructs the ADK tool used to create a structured ticket.
+func buildCreateStructuredTicketTool(createdTicketID *string) (tool.Tool, error) {
+	return functiontool.New(functiontool.Config{
+		Name:        "create_structured_ticket",
+		Description: "Create a structured ticket with a title, severity, root cause, and proposed fix.",
+	}, func(ctx agent.Context, args CreateTicketArgs) (CreateTicketResult, error) {
+		result, err := CreateStructuredTicket(ctx, args)
+		if err == nil && result.TicketID != "" && createdTicketID != nil {
+			*createdTicketID = result.TicketID
+		}
+		return result, err
+	})
 }
 
 func runWorkflow(ctx context.Context) error {
@@ -543,24 +565,12 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 func runADKTriage(ctx context.Context, model model.LLM) (string, error) {
 	var createdTicketID string
 
-	readLogTool, err := functiontool.New(functiontool.Config{
-		Name:        "read_latest_error_log",
-		Description: "Read the latest redacted error log from the local logs directory.",
-	}, ReadLatestErrorLog)
+	readLogTool, err := buildReadLatestErrorLogTool()
 	if err != nil {
 		return "", fmt.Errorf("create read log tool: %w", err)
 	}
 
-	ticketTool, err := functiontool.New(functiontool.Config{
-		Name:        "create_structured_ticket",
-		Description: "Create a structured ticket with a title, severity, root cause, and proposed fix.",
-	}, func(ctx agent.Context, args CreateTicketArgs) (CreateTicketResult, error) {
-		result, err := CreateStructuredTicket(ctx, args)
-		if err == nil && result.TicketID != "" {
-			createdTicketID = result.TicketID
-		}
-		return result, err
-	})
+	ticketTool, err := buildCreateStructuredTicketTool(&createdTicketID)
 	if err != nil {
 		return "", fmt.Errorf("create ticket tool: %w", err)
 	}

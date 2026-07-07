@@ -15,6 +15,34 @@ The Automated DevOps Triage Agent routes simulated error logs through a determin
 go run .
 ```
 
+## Secrets and Model Access
+
+This agent uses the Gemini model and expects an API key to be available in one of the following environment variables:
+
+- `GEMINI_API_KEY`
+- `GOOGLE_API_KEY`
+
+For local development, set the variable in your shell before running:
+
+```bash
+export GEMINI_API_KEY="your-gemini-api-key"
+go run .
+```
+
+For production deployment, secret management should be handled by your cloud provider or runtime environment. On Google Cloud, use Secret Manager to inject the model credential into the container environment and keep local state in the SQLite file at `./state/workflow_state.sqlite`.
+
+## Terraform Usage
+
+The `terraform/` directory contains a minimal scaffold to deploy the agent as a Cloud Run service.
+
+```bash
+cd terraform
+terraform init
+terraform apply
+```
+
+After the apply succeeds, update the Cloud Run service image or environment variables as needed for your deployment.
+
 ## Testing
 
 ```bash
