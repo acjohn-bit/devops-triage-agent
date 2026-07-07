@@ -4,10 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"time"
+	"strings"
 
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/agent/tool"
@@ -19,6 +20,10 @@ import (
 // 1. TOOL & INTERFACE DEFINITIONS
 // Statically typed structs with `jsonschema` tags guarantee Gemini outputs perfectly formatted parameters.
 // ==========================================
+
+func redactPII(input string) string {
+	return strings.ReplaceAll(input, "user@example.com", "[REDACTED_EMAIL]")
+}
 
 // --- Tool 1: Read Log ---
 type ReadLogArgs struct{} 
@@ -55,7 +60,8 @@ func ReadLatestErrorLog(ctx context.Context, args ReadLogArgs) (ReadLogResult, e
 		return ReadLogResult{}, err
 	}
 
-	log.Printf("Tool called: Read log file %s", latestFile)
+	content = []byte(redactPII(string(content)))
+	slog.Info("Tool called: Read log file %s", latestFile)
 	return ReadLogResult{Content: string(content)}, nil
 }
 
@@ -98,7 +104,7 @@ func CreateStructuredTicket(ctx context.Context, args CreateTicketArgs) (CreateT
 		return CreateTicketResult{Status: "Failed to write file"}, err
 	}
 
-	log.Printf("Tool called: Created structured ticket %s", filePath)
+	slog.Info("Tool called: Created structured ticket %s", filePath)
 	return CreateTicketResult{Status: fmt.Sprintf("Success: Ticket created with ID %s", ticketID)}, nil
 }
 
@@ -107,6 +113,11 @@ func CreateStructuredTicket(ctx context.Context, args CreateTicketArgs) (CreateT
 // ==========================================
 
 func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	slog.SetDefault(logger)
+
+	slog.Info("Starting DevOps Triage Agent...")
+
 	os.MkdirAll("./logs", 0755)
 	os.MkdirAll("./tickets", 0755)
 
@@ -116,13 +127,13 @@ Traceback (most recent call last):
 panic: runtime error: invalid memory address or nil pointer dereference`
 	os.WriteFile("./logs/crash_001.log", []byte(mockError), 0644)
 
-	log.Println("Initializing Go ADK Triage Agent...")
+	slog.Info("Initializing Go ADK Triage Agent...")
 	ctx := context.Background()
 
 	// Initialize Gemini via ADK
 	model, err := gemini.NewModel(ctx, "gemini-2.5-flash", nil)
 	if err != nil {
-		log.Fatalf("Failed to init model: %v", err)
+		slog.Error("Failed to init model: %v", err)
 	}
 
 	// Wrap Go functions as ADK Tools
@@ -148,7 +159,7 @@ panic: runtime error: invalid memory address or nil pointer dereference`
 		Tools: []tool.Tool{readLogTool, createTicketTool},
 	})
 	if err != nil {
-		log.Fatalf("Failed to init agent: %v", err)
+		slog.Error("Failed to init agent: %v", err)
 	}
 
 	qaInstructions := `You are a QA agent that reviews structured engineering tickets for accuracy and completeness.`
@@ -164,13 +175,13 @@ panic: runtime error: invalid memory address or nil pointer dereference`
 	reader := bufio.NewReader(os.Stdin)
 	approval, _ := reader.ReadString('\n')
 	if approval != "Y\n" && approval != "y\n" {
-		log.Println("Ticket creation aborted by human operator.")
+		slog.Error("Ticket creation aborted by human operator.")
 		return
 	}
-	log.Println("Human operator approved ticket creation.")
+	slog.Info("Human operator approved ticket creation.")
 
 	// ADK Go native multi-turn execution (simplistic simulated runner for local PoC)
 	// In production, this agent would be attached to a Web / RPC server or the ADK Launcher.
-	log.Println("--- Agent Ready. Simulating Execution Loop ---")
-	log.Println("Triage Pipeline executing... (Check /tickets for output)")
+	slog.Info("--- Agent Ready. Simulating Execution Loop ---")
+	slog.Info("Triage Pipeline executing... (Check /tickets for output)")
 }
