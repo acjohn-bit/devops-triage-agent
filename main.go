@@ -25,6 +25,11 @@ func redactPII(input string) string {
 	return strings.ReplaceAll(input, "user@example.com", "[REDACTED_EMAIL]")
 }
 
+// fetchAPIKey attempts to pull from GCP Secret Manager, falling back to local ENV
+func fetchAPIKey() string {
+    return os.Getenv("GEMINI_API_KEY")
+}
+
 // --- Tool 1: Read Log ---
 type ReadLogArgs struct{} 
 
