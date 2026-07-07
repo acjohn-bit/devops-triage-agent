@@ -23,9 +23,13 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
+	"google.golang.org/adk/v2/model"
 	"google.golang.org/adk/v2/model/gemini"
+	"google.golang.org/adk/v2/runner"
+	"google.golang.org/adk/v2/session"
 	"google.golang.org/adk/v2/tool"
 	"google.golang.org/adk/v2/tool/functiontool"
+	"google.golang.org/genai"
 )
 
 const (
@@ -370,12 +374,21 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 	_ = ctx
 
 	if apiKey := fetchAPIKey(); apiKey != "" {
-		if _, modelErr := gemini.NewModel(ctx, "gemini-2.5-flash", nil); modelErr != nil {
+		model, modelErr := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{APIKey: apiKey})
+		if modelErr != nil {
 			slog.Warn("agent.model.init_failed", "error", modelErr)
 		} else {
-			_ = llmagent.New
-			_ = tool.Tool(nil)
-			_ = functiontool.Config{}
+			if ticketID, runErr := runADKTriage(ctx, model); runErr != nil {
+				slog.Warn("agent.execution.failed", "error", runErr)
+			} else {
+				state.LastTicketID = ticketID
+				state.appendHistory(fmt.Sprintf("created ticket %s", ticketID))
+				if saveErr := state.save(defaultStatePathValue); saveErr != nil {
+					return fmt.Errorf("save workflow state: %w", saveErr)
+				}
+				slog.Info("workflow.complete", "trace_id", state.TraceID, "ticket_id", ticketID, "status", "created_by_adk")
+				return nil
+			}
 		}
 	} else {
 		slog.Warn("agent.model.init_skipped", "reason", "GEMINI_API_KEY not configured; using deterministic local workflow")
@@ -436,6 +449,70 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 
 	slog.Info("workflow.complete", "trace_id", state.TraceID, "ticket_id", result.TicketID, "status", result.Status)
 	return nil
+}
+
+func runADKTriage(ctx context.Context, model model.LLM) (string, error) {
+	var createdTicketID string
+
+	readLogTool, err := functiontool.New(functiontool.Config{
+		Name:        "read_latest_error_log",
+		Description: "Read the latest redacted error log from the local logs directory.",
+	}, ReadLatestErrorLog)
+	if err != nil {
+		return "", fmt.Errorf("create read log tool: %w", err)
+	}
+
+	ticketTool, err := functiontool.New(functiontool.Config{
+		Name:        "create_structured_ticket",
+		Description: "Create a structured ticket with a title, severity, root cause, and proposed fix.",
+	}, func(ctx agent.Context, args CreateTicketArgs) (CreateTicketResult, error) {
+		result, err := CreateStructuredTicket(ctx, args)
+		if err == nil && result.TicketID != "" {
+			createdTicketID = result.TicketID
+		}
+		return result, err
+	})
+	if err != nil {
+		return "", fmt.Errorf("create ticket tool: %w", err)
+	}
+
+	triageAgent, err := llmagent.New(llmagent.Config{
+		Name:        "triage_agent",
+		Description: "A devops triage assistant that reads local logs and generates structured bug tickets when needed.",
+		Model:       model,
+		Instruction: "You are a devops incident triage assistant. First use the read_latest_error_log tool to inspect the most recent error log. If the log shows a real crash, call create_structured_ticket with a concise title, severity, root_cause, and proposed_fix. If the log does not require a ticket, explain why no ticket should be created.",
+		GlobalInstruction: "Be factual, do not hallucinate, and only use the provided tools.",
+		Tools:       []tool.Tool{readLogTool, ticketTool},
+	})
+	if err != nil {
+		return "", fmt.Errorf("create triage agent: %w", err)
+	}
+
+	sessionService := session.InMemoryService()
+	runner, err := runner.New(runner.Config{AppName: "devops-triage-agent", Agent: triageAgent, SessionService: sessionService, AutoCreateSession: true})
+	if err != nil {
+		return "", fmt.Errorf("create runner: %w", err)
+	}
+
+	userMessage := genai.NewContentFromText("Review the latest error log and create a structured ticket if appropriate.", genai.RoleUser)
+	for event, err := range runner.Run(ctx, "devops-triage-user", "triage-session", userMessage, agent.RunConfig{StreamingMode: agent.StreamingModeNone}) {
+		if err != nil {
+			return "", err
+		}
+		if event == nil {
+			continue
+		}
+		slog.Info("agent.event", "author", event.Author, "final", event.IsFinalResponse(), "branch", event.Branch)
+		if event.LLMResponse.Content != nil {
+			for _, part := range event.LLMResponse.Content.Parts {
+				if strings.TrimSpace(part.Text) != "" {
+					slog.Debug("agent.event.text", "text", strings.TrimSpace(part.Text))
+				}
+			}
+		}
+	}
+
+	return createdTicketID, nil
 }
 
 func seedSampleLog(logDir string) error {
