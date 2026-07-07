@@ -6,6 +6,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	st "devops-triage-agent/state"
+	"devops-triage-agent/agents"
 )
 
 func TestRedactPIIWithMultipleEmailFormats(t *testing.T) {
@@ -23,7 +26,7 @@ func TestRedactPIIWithMultipleEmailFormats(t *testing.T) {
 
 func TestCompactHistoryKeepsRecentEvents(t *testing.T) {
 	history := []string{"read log", "triaged issue", "approved ticket", "rejected ticket", "wrote report"}
-	got := compactHistory(history, 3)
+	got := st.CompactHistory(history, 3)
 
 	if len(got) != 3 {
 		t.Fatalf("expected 3 compacted entries, got %d", len(got))
@@ -47,18 +50,18 @@ func TestInferSeverityFromErrorSignals(t *testing.T) {
 
 func TestStateStorePersistsHistory(t *testing.T) {
 	dbPath := filepath.Join(t.TempDir(), "workflow.sqlite")
-	store, err := openStateStore(dbPath)
+	store, err := st.OpenStateStore(dbPath)
 	if err != nil {
 		t.Fatalf("open state store: %v", err)
 	}
-	defer store.close()
+	defer store.Close()
 
-	state := &workflowState{TraceID: "trace-123", History: []string{"started"}}
-	if err := store.saveState(state); err != nil {
+	state := &st.State{TraceID: "trace-123", History: []string{"started"}}
+	if err := store.SaveState(state); err != nil {
 		t.Fatalf("save state: %v", err)
 	}
 
-	loaded, err := store.loadState()
+	loaded, err := store.LoadState()
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
@@ -97,8 +100,8 @@ func TestSelectAgentModelHonorsRoleSpecificOverride(t *testing.T) {
 
 func TestAgenticValidationFallback(t *testing.T) {
 	// When no model is provided, agentic evaluator should fall back to deterministic review.
-	proposed := &ProposedTicket{Title: "DB failure", Severity: "HIGH", RootCause: "database down", ProposedFix: "restart DB"}
-	decision, rationale, err := evaluateProposedTicketWithAgent(context.Background(), nil, proposed)
+	proposed := map[string]string{"title": "DB failure", "severity": "HIGH", "root_cause": "database down", "proposed_fix": "restart DB"}
+	decision, rationale, err := agents.EvaluateProposedTicketWithAgent(context.Background(), "", "", proposed)
 	if err != nil {
 		t.Fatalf("evaluator error: %v", err)
 	}
