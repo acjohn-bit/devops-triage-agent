@@ -1,43 +1,43 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
-	"time"
 	"strings"
+	"time"
 
+	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
-	"google.golang.org/adk/v2/agent/tool"
-	"google.golang.org/adk/v2/agent/tool/functiontool"
 	"google.golang.org/adk/v2/model/gemini"
+	"google.golang.org/adk/v2/tool"
+	"google.golang.org/adk/v2/tool/functiontool"
 )
-
-// ==========================================
-// 1. TOOL & INTERFACE DEFINITIONS
-// Statically typed structs with `jsonschema` tags guarantee Gemini outputs perfectly formatted parameters.
-// ==========================================
-
-func redactPII(input string) string {
-	return strings.ReplaceAll(input, "user@example.com", "[REDACTED_EMAIL]")
-}
 
 // fetchAPIKey attempts to pull from GCP Secret Manager, falling back to local ENV
 func fetchAPIKey() string {
     return os.Getenv("GEMINI_API_KEY")
 }
 
-// --- Tool 1: Read Log ---
-type ReadLogArgs struct{} 
+func redactPII(input string) string {
+	return strings.ReplaceAll(input, "user@example.com", "[REDACTED_EMAIL]")
+}
+
+// ==========================================
+// 1. TOOL & INTERFACE DESIGN CRITERIA
+// ==========================================
+
+type ReadLogArgs struct{}
 
 type ReadLogResult struct {
 	Content string `json:"content"`
 }
 
-func ReadLatestErrorLog(ctx context.Context, args ReadLogArgs) (ReadLogResult, error) {
+func ReadLatestErrorLog(ctx agent.Context, args ReadLogArgs) (ReadLogResult, error) {
 	logDir := "./logs"
 	files, err := os.ReadDir(logDir)
 	if err != nil || len(files) == 0 {
@@ -65,12 +65,10 @@ func ReadLatestErrorLog(ctx context.Context, args ReadLogArgs) (ReadLogResult, e
 		return ReadLogResult{}, err
 	}
 
-	content = []byte(redactPII(string(content)))
-	slog.Info("Tool called: Read log file %s", latestFile)
-	return ReadLogResult{Content: string(content)}, nil
+	slog.Info("Tool called: Read log file", "file", latestFile)
+	return ReadLogResult{Content: redactPII(string(content))}, nil
 }
 
-// --- Tool 2: Create Ticket ---
 type CreateTicketArgs struct {
 	Title       string `json:"title" jsonschema:"description=Short descriptive summary of the bug"`
 	Severity    string `json:"severity" jsonschema:"description=CRITICAL, HIGH, MEDIUM, or LOW"`
@@ -82,8 +80,7 @@ type CreateTicketResult struct {
 	Status string `json:"status"`
 }
 
-func CreateStructuredTicket(ctx context.Context, args CreateTicketArgs) (CreateTicketResult, error) {
-	ticketDir := "./tickets"
+func CreateStructuredTicket(ctx agent.Context, args CreateTicketArgs) (CreateTicketResult, error) {	ticketDir := "./tickets"
 	os.MkdirAll(ticketDir, 0755)
 
 	ticketID := fmt.Sprintf("BUG-%d", time.Now().Unix())
@@ -109,7 +106,7 @@ func CreateStructuredTicket(ctx context.Context, args CreateTicketArgs) (CreateT
 		return CreateTicketResult{Status: "Failed to write file"}, err
 	}
 
-	slog.Info("Tool called: Created structured ticket %s", filePath)
+	slog.Info("Tool called: Created structured ticket", "path", filePath)
 	return CreateTicketResult{Status: fmt.Sprintf("Success: Ticket created with ID %s", ticketID)}, nil
 }
 
@@ -121,72 +118,76 @@ func main() {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	slog.Info("Starting DevOps Triage Agent...")
+	slog.Info("Intent: Initiating DevOps triage workflow")
 
 	os.MkdirAll("./logs", 0755)
 	os.MkdirAll("./tickets", 0755)
 
-	mockError := `2026-07-04T23:14:02Z ERROR [user-service] database connection failed.
-Traceback (most recent call last):
-  File "/app/db.go", line 42, in connect
+	mockError := `2026-07-04T23:14:02Z ERROR [user-service] database connection failed for user@example.com.
 panic: runtime error: invalid memory address or nil pointer dereference`
 	os.WriteFile("./logs/crash_001.log", []byte(mockError), 0644)
 
-	slog.Info("Initializing Go ADK Triage Agent...")
 	ctx := context.Background()
-
-	// Initialize Gemini via ADK
 	model, err := gemini.NewModel(ctx, "gemini-2.5-flash", nil)
 	if err != nil {
-		slog.Error("Failed to init model: %v", err)
+		slog.Error("Failed to init model", "error", err)
+		os.Exit(1)
 	}
 
-	// Wrap Go functions as ADK Tools
-	readLogTool := functiontool.New(functiontool.Config{
+	readLogTool, err := functiontool.New[ReadLogArgs, ReadLogResult](functiontool.Config{
 		Name:        "read_latest_error_log",
 		Description: "Reads the most recent error log file from the local logs directory.",
 	}, ReadLatestErrorLog)
+	if err != nil {
+		slog.Error("Failed to init tool", "error", err)
+	}
 
-	createTicketTool := functiontool.New(functiontool.Config{
+	createTicketTool, err := functiontool.New[CreateTicketArgs, CreateTicketResult](functiontool.Config{
 		Name:        "create_structured_ticket",
 		Description: "Generates a structured engineering ticket inside the /tickets directory.",
 	}, CreateStructuredTicket)
-	
-	baseInstructions := `You are responsible for triaging server crash logs and creating structured engineering tickets.
-					Your job is to process raw server crash logs, isolate the precise root cause, and output a structured ticket for human developers.
-					Always call "read_latest_error_log" first to pull the data. Analyze it deeply, then call "create_structured_ticket" with your final analysis.`
+	if err != nil {
+		slog.Error("Failed to init tool", "error", err)
+	}
 
-	// Build the LlmAgent
 	agent, err := llmagent.New(llmagent.Config{
 		Name:  "DevOpsTriageAgent",
 		Model: model,
-		Instruction: baseInstructions,
+		Instruction: `You are an expert DevOps engineer. Always call "read_latest_error_log" first. 
+						If a tool returns an error or fails, do not crash. Analyze the error string, adjust your parameters, and gracefully retry the tool call.`,
 		Tools: []tool.Tool{readLogTool, createTicketTool},
 	})
 	if err != nil {
-		slog.Error("Failed to init agent: %v", err)
+		slog.Error("Failed to init agent", "error", err)
 	}
+	_ = agent
 
-	qaInstructions := `You are a QA agent that reviews structured engineering tickets for accuracy and completeness.`
-
-	qaAgent, _ := llmagent.New(llmagent.Config{
-		Name:  "TicketQAAgent",
-		Model: model,
-		Instruction: qaInstructions,
-		Tools: []tool.Tool{createTicketTool},
+	qaAgent, err := llmagent.New(llmagent.Config{
+		Name:        "TicketQA_Agent",
+		Model:       model,
+		Instruction: "Review the drafted JSON ticket. Ensure it contains no PII and is technically accurate. Reply 'APPROVED' or 'REJECTED'.",
 	})
+	if err != nil {
+		slog.Error("Failed to init QA agent", "error", err)
+	}
+	_ = qaAgent
 
+	slog.Info("--- Agent Ready. Simulating Execution Loop ---")
+
+	// Human-in-the-Loop check
 	fmt.Print("\n[Human-in-the-Loop] Agent proposes creating a ticket. Approve? (Y/N): ")
 	reader := bufio.NewReader(os.Stdin)
 	approval, _ := reader.ReadString('\n')
-	if approval != "Y\n" && approval != "y\n" {
-		slog.Error("Ticket creation aborted by human operator.")
-		return
-	}
-	slog.Info("Human operator approved ticket creation.")
 
-	// ADK Go native multi-turn execution (simplistic simulated runner for local PoC)
-	// In production, this agent would be attached to a Web / RPC server or the ADK Launcher.
-	slog.Info("--- Agent Ready. Simulating Execution Loop ---")
-	slog.Info("Triage Pipeline executing... (Check /tickets for output)")
+	if strings.TrimSpace(strings.ToUpper(approval)) == "Y" {
+		CreateStructuredTicket(nil, CreateTicketArgs{
+			Title:       "Database Connection Failure",
+			Severity:    "HIGH",
+			RootCause:   "Nil pointer dereference in user-service database connection.",
+			ProposedFix: "Add nil check before connection initialization in db.go.",
+		})
+		slog.Info("Outcome: Human approved. Ticket created.")
+	} else {
+		slog.Warn("Outcome: Human rejected. Halting workflow.")
+	}
 }
