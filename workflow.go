@@ -25,6 +25,12 @@ const (
 	defaultStatePath = "./state/workflow_state.json"
 )
 
+var (
+	defaultLogsDirValue   = defaultLogsDir
+	defaultTicketsDirValue = defaultTicketsDir
+	defaultStatePathValue = defaultStatePath
+)
+
 var emailPattern = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
 var secretPattern = regexp.MustCompile(`(?i)\b(?:password|token|api[_-]?key)[\s:=]+[A-Za-z0-9._-]{3,}`)
 
@@ -156,8 +162,9 @@ func inferSeverity(logContent string) string {
 	}
 }
 
+// ReadLatestErrorLog reads the newest local .log file and returns its redacted contents.
 func ReadLatestErrorLog(ctx agent.Context, args ReadLogArgs) (ReadLogResult, error) {
-	logDir := defaultLogsDir
+	logDir := defaultLogsDirValue
 	files, err := os.ReadDir(logDir)
 	if err != nil || len(files) == 0 {
 		return ReadLogResult{Content: "Error: No logs found in directory; add a .log file and retry."}, nil
@@ -191,8 +198,9 @@ func ReadLatestErrorLog(ctx agent.Context, args ReadLogArgs) (ReadLogResult, err
 	return ReadLogResult{Content: redactPII(string(content))}, nil
 }
 
+// CreateStructuredTicket writes a structured engineering ticket to the local tickets directory.
 func CreateStructuredTicket(ctx agent.Context, args CreateTicketArgs) (CreateTicketResult, error) {
-	ticketDir := defaultTicketsDir
+	ticketDir := defaultTicketsDirValue
 	if err := os.MkdirAll(ticketDir, 0o755); err != nil {
 		return CreateTicketResult{Status: "Failed to create ticket directory"}, err
 	}
@@ -223,26 +231,34 @@ func CreateStructuredTicket(ctx agent.Context, args CreateTicketArgs) (CreateTic
 }
 
 func runWorkflow(ctx context.Context) error {
+	return runWorkflowWithInput("", false)
+}
+
+func runWorkflowWithInput(input string, nonInteractive bool) error {
+	return runWorkflowWithInputContext(context.Background(), input, nonInteractive)
+}
+
+func runWorkflowWithInputContext(ctx context.Context, input string, nonInteractive bool) error {
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
-	state, err := loadWorkflowState(defaultStatePath)
+	state, err := loadWorkflowState(defaultStatePathValue)
 	if err != nil {
 		return fmt.Errorf("load workflow state: %w", err)
 	}
 
-	if err := os.MkdirAll(defaultLogsDir, 0o755); err != nil {
+	if err := os.MkdirAll(defaultLogsDirValue, 0o755); err != nil {
 		return fmt.Errorf("create logs directory: %w", err)
 	}
-	if err := os.MkdirAll(defaultTicketsDir, 0o755); err != nil {
+	if err := os.MkdirAll(defaultTicketsDirValue, 0o755); err != nil {
 		return fmt.Errorf("create tickets directory: %w", err)
 	}
 
-	if err := seedSampleLog(defaultLogsDir); err != nil {
+	if err := seedSampleLog(defaultLogsDirValue); err != nil {
 		return fmt.Errorf("seed sample log: %w", err)
 	}
 
-	slog.Info("workflow.start", "trace_id", state.TraceID, "history_len", len(state.History))
+	slog.Info("workflow.start", "trace_id", state.TraceID, "history_len", len(state.History), "mode", "deterministic")
 	state.appendHistory("workflow started")
 
 	if apiKey := fetchAPIKey(); apiKey != "" {
@@ -257,7 +273,7 @@ func runWorkflow(ctx context.Context) error {
 		slog.Warn("agent.model.init_skipped", "reason", "GEMINI_API_KEY not configured; using deterministic local workflow")
 	}
 
-	logContent, err := readLatestLogFile(defaultLogsDir)
+	logContent, err := readLatestLogFile(defaultLogsDirValue)
 	if err != nil {
 		return fmt.Errorf("read latest log: %w", err)
 	}
@@ -267,19 +283,19 @@ func runWorkflow(ctx context.Context) error {
 	state.appendHistory(fmt.Sprintf("drafted ticket %q", draft.Title))
 
 	reviewResult := reviewTicketDraft(draft)
-	slog.Info("agent.execution", "agent", "qa", "action", "validate_ticket", "decision", reviewResult)
+	slog.Info("agent.execution", "agent", "qa", "action", "validate_ticket", "decision", reviewResult, "trace_id", state.TraceID)
 	if reviewResult != "APPROVED" {
 		state.appendHistory("qa rejected ticket draft")
-		if saveErr := state.save(defaultStatePath); saveErr != nil {
+		if saveErr := state.save(defaultStatePathValue); saveErr != nil {
 			return fmt.Errorf("save workflow state: %w", saveErr)
 		}
 		return nil
 	}
 
-	approval := promptForApproval()
+	approval := promptForApproval(input, nonInteractive)
 	if !approval {
 		state.appendHistory("human rejected ticket")
-		if saveErr := state.save(defaultStatePath); saveErr != nil {
+		if saveErr := state.save(defaultStatePathValue); saveErr != nil {
 			return fmt.Errorf("save workflow state: %w", saveErr)
 		}
 		return nil
@@ -297,7 +313,7 @@ func runWorkflow(ctx context.Context) error {
 
 	state.LastTicketID = result.TicketID
 	state.appendHistory(fmt.Sprintf("created ticket %s", result.TicketID))
-	if saveErr := state.save(defaultStatePath); saveErr != nil {
+	if saveErr := state.save(defaultStatePathValue); saveErr != nil {
 		return fmt.Errorf("save workflow state: %w", saveErr)
 	}
 
@@ -375,7 +391,13 @@ func reviewTicketDraft(draft ticketDraft) string {
 	return "APPROVED"
 }
 
-func promptForApproval() bool {
+func promptForApproval(input string, nonInteractive bool) bool {
+	if nonInteractive {
+		return true
+	}
+	if strings.TrimSpace(input) != "" {
+		return strings.TrimSpace(strings.ToUpper(input)) == "Y"
+	}
 	fmt.Print("\n[Human-in-the-Loop] Agent proposes creating a ticket. Approve? (Y/N): ")
 	reader := bufio.NewReader(os.Stdin)
 	approval, _ := reader.ReadString('\n')
