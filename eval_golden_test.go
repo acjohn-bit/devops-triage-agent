@@ -10,16 +10,16 @@ func TestGoldenWorkflowProducesTicket(t *testing.T) {
 	tmpDir := t.TempDir()
 	originalLogsDir := defaultLogsDirValue
 	originalTicketsDir := defaultTicketsDirValue
-	originalStatePath := defaultStatePathValue
+	originalStateDB := defaultStateDBValue
 	defer func() {
 		defaultLogsDirValue = originalLogsDir
 		defaultTicketsDirValue = originalTicketsDir
-		defaultStatePathValue = originalStatePath
+		defaultStateDBValue = originalStateDB
 	}()
 
 	defaultLogsDirValue = filepath.Join(tmpDir, "logs")
 	defaultTicketsDirValue = filepath.Join(tmpDir, "tickets")
-	defaultStatePathValue = filepath.Join(tmpDir, "state", "workflow_state.json")
+	defaultStateDBValue = filepath.Join(tmpDir, "state", "workflow_state.sqlite")
 
 	if err := os.MkdirAll(defaultLogsDirValue, 0o755); err != nil {
 		t.Fatalf("create logs dir: %v", err)

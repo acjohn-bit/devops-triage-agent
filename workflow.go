@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -34,16 +35,15 @@ import (
 )
 
 const (
-	defaultLogsDir   = "./logs"
+	defaultLogsDir    = "./logs"
 	defaultTicketsDir = "./tickets"
-	defaultStatePath = "./state/workflow_state.json"
-	defaultStateDB   = "./state/workflow_state.sqlite"
+	defaultStateDB    = "./state/workflow_state.sqlite"
 )
 
 var (
-	defaultLogsDirValue   = defaultLogsDir
+	defaultLogsDirValue    = defaultLogsDir
 	defaultTicketsDirValue = defaultTicketsDir
-	defaultStatePathValue = defaultStatePath
+	defaultStateDBValue    = defaultStateDB
 )
 
 var emailPattern = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b`)
@@ -60,6 +60,9 @@ type stateStore struct {
 }
 
 func openStateStore(path string) (*stateStore, error) {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return nil, err
+	}
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
@@ -109,6 +112,80 @@ func (s *stateStore) loadState() (*workflowState, error) {
 	return &workflowState{TraceID: traceID, History: history, LastTicketID: lastTicketID}, nil
 }
 
+type asyncStateSaver struct {
+	store *stateStore
+	queue chan *workflowState
+	wg    sync.WaitGroup
+}
+
+func newAsyncStateSaver(store *stateStore) *asyncStateSaver {
+	if store == nil {
+		return nil
+	}
+	s := &asyncStateSaver{
+		store: store,
+		queue: make(chan *workflowState, 4),
+	}
+	s.wg.Add(1)
+	go s.run()
+	return s
+}
+
+func (s *asyncStateSaver) Save(state *workflowState) {
+	if s == nil || state == nil {
+		return
+	}
+	copy := cloneWorkflowState(state)
+	select {
+	case s.queue <- copy:
+	default:
+		select {
+		case <-s.queue:
+		default:
+		}
+		s.queue <- copy
+	}
+}
+
+func (s *asyncStateSaver) Close(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	close(s.queue)
+	c := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(c)
+	}()
+	select {
+	case <-c:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (s *asyncStateSaver) run() {
+	defer s.wg.Done()
+	for state := range s.queue {
+		if err := s.store.saveState(state); err != nil {
+			slog.Warn("workflow.state.persist_failed", "error", err)
+		}
+	}
+}
+
+func cloneWorkflowState(state *workflowState) *workflowState {
+	if state == nil {
+		return nil
+	}
+	historyCopy := append([]string(nil), state.History...)
+	return &workflowState{
+		TraceID:      state.TraceID,
+		History:      historyCopy,
+		LastTicketID: state.LastTicketID,
+	}
+}
+
 type ticketDraft struct {
 	Title       string
 	Severity    string
@@ -139,42 +216,6 @@ func newWorkflowState() *workflowState {
 		TraceID: newTraceID(),
 		History: []string{},
 	}
-}
-
-func loadWorkflowState(path string) (*workflowState, error) {
-	content, err := os.ReadFile(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return newWorkflowState(), nil
-		}
-		return nil, err
-	}
-
-	var state workflowState
-	if err := json.Unmarshal(content, &state); err != nil {
-		return nil, err
-	}
-	if state.TraceID == "" {
-		state.TraceID = newTraceID()
-	}
-	if state.History == nil {
-		state.History = []string{}
-	}
-	return &state, nil
-}
-
-func (s *workflowState) save(path string) error {
-	if s == nil {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return err
-	}
-	payload, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, payload, 0o644)
 }
 
 func (s *workflowState) appendHistory(event string) {
@@ -362,10 +403,25 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 		defer tracerProvider.Shutdown(ctx)
 	}
 
-	state, err := loadWorkflowState(defaultStatePathValue)
+	store, err := openStateStore(defaultStateDBValue)
+	if err != nil {
+		return fmt.Errorf("open workflow state store: %w", err)
+	}
+	defer store.close()
+
+	state, err := store.loadState()
 	if err != nil {
 		return fmt.Errorf("load workflow state: %w", err)
 	}
+
+	saver := newAsyncStateSaver(store)
+	defer func() {
+		if closeErr := saver.Close(ctx); closeErr != nil {
+			slog.Warn("workflow.state.shutdown_failed", "error", closeErr)
+		}
+	}()
+
+	saver.Save(state)
 
 	tracer := otel.Tracer("devops-triage-agent")
 	ctx, workflowSpan := tracer.Start(ctx, "workflow.start")
@@ -386,6 +442,7 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 
 	slog.Info("workflow.start", "trace_id", state.TraceID, "history_len", len(state.History), "mode", "deterministic")
 	state.appendHistory("workflow started")
+	saver.Save(state)
 	logActionOutcome("workflow.start", "workflow initialized", "history_length", len(state.History))
 	_ = ctx
 
@@ -394,14 +451,14 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 		if modelErr != nil {
 			slog.Warn("agent.model.init_failed", "error", modelErr)
 		} else {
+			state.appendHistory("agent turn start")
+			saver.Save(state)
 			if ticketID, runErr := runADKTriage(ctx, model); runErr != nil {
 				slog.Warn("agent.execution.failed", "error", runErr)
 			} else {
 				state.LastTicketID = ticketID
 				state.appendHistory(fmt.Sprintf("created ticket %s", ticketID))
-				if saveErr := state.save(defaultStatePathValue); saveErr != nil {
-					return fmt.Errorf("save workflow state: %w", saveErr)
-				}
+				saver.Save(state)
 				slog.Info("workflow.complete", "trace_id", state.TraceID, "ticket_id", ticketID, "status", "created_by_adk")
 				return nil
 			}
@@ -438,15 +495,6 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 	state.appendHistory(fmt.Sprintf("drafted ticket %q", draft.Title))
 	logActionOutcome("ticket.draft", "draft created", "severity", draft.Severity, "title", draft.Title)
 	draftSpan.End()
-	if _, err := os.Stat(defaultStateDB); err == nil {
-		store, err := openStateStore(defaultStateDB)
-		if err == nil {
-			if saveErr := store.saveState(state); saveErr != nil {
-				slog.Warn("workflow.state.persist_failed", "error", saveErr)
-			}
-			_ = store.close()
-		}
-	}
 
 	_, validationSpan := tracer.Start(spanCtx, "workflow.ticket_validation")
 	logActionIntent("ticket.validation", "Validate the drafted ticket for completeness and sensitivity")
@@ -456,9 +504,7 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 		validationSpan.SetAttributes(attribute.String("validation_result", reviewResult))
 		validationSpan.End()
 		state.appendHistory("qa rejected ticket draft")
-		if saveErr := state.save(defaultStatePathValue); saveErr != nil {
-			return fmt.Errorf("save workflow state: %w", saveErr)
-		}
+		saver.Save(state)
 		return nil
 	}
 	validationSpan.SetAttributes(attribute.String("validation_result", reviewResult))
@@ -467,9 +513,7 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 	approval := promptForApproval(input, nonInteractive)
 	if !approval {
 		state.appendHistory("human rejected ticket")
-		if saveErr := state.save(defaultStatePathValue); saveErr != nil {
-			return fmt.Errorf("save workflow state: %w", saveErr)
-		}
+		saver.Save(state)
 		return nil
 	}
 
@@ -489,11 +533,7 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 
 	state.LastTicketID = result.TicketID
 	state.appendHistory(fmt.Sprintf("created ticket %s", result.TicketID))
-	if saveErr := state.save(defaultStatePathValue); saveErr != nil {
-		creationSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", saveErr.Error()))
-		return fmt.Errorf("save workflow state: %w", saveErr)
-	}
-
+	saver.Save(state)
 	creationSpan.SetAttributes(attribute.String("outcome", "success"), attribute.String("ticket_id", result.TicketID), attribute.String("ticket_status", result.Status))
 	logActionOutcome("ticket.creation", "ticket created", "ticket_id", result.TicketID, "status", result.Status)
 	slog.Info("workflow.complete", "trace_id", state.TraceID, "ticket_id", result.TicketID, "status", result.Status)
