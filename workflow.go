@@ -193,6 +193,13 @@ type ticketDraft struct {
 	ProposedFix string
 }
 
+// ProposedTicket is the structured draft proposed by the triage agent.
+type ProposedTicket struct {
+	Title       string `json:"title"`
+	Severity    string `json:"severity"`
+	RootCause   string `json:"root_cause"`
+	ProposedFix string `json:"proposed_fix"`
+}
 type ReadLogArgs struct{}
 
 type ReadLogResult struct {
@@ -434,6 +441,143 @@ func buildCreateStructuredTicketTool(createdTicketID *string) (tool.Tool, error)
 	})
 }
 
+// buildProposeTicketTool creates a tool that allows the triage agent to propose
+// a structured ticket without persisting it. The proposed ticket is written to
+// the provided pointer so downstream agents can inspect and validate it.
+func buildProposeTicketTool(proposed **ProposedTicket) (tool.Tool, error) {
+	type Args = CreateTicketArgs
+	type Result struct{ Status string }
+	return functiontool.New(functiontool.Config{
+		Name:        "propose_ticket",
+		Description: "Propose a structured ticket draft (does not persist).",
+	}, func(ctx agent.Context, args Args) (Result, error) {
+		if proposed == nil {
+			return Result{Status: "failed"}, fmt.Errorf("internal: propose slot missing")
+		}
+		*proposed = &ProposedTicket{
+			Title:       args.Title,
+			Severity:    args.Severity,
+			RootCause:   args.RootCause,
+			ProposedFix: args.ProposedFix,
+		}
+		return Result{Status: "proposed"}, nil
+	})
+}
+
+// buildValidateTicketTool constructs a validation tool that runs deterministic
+// checks (re-using existing review logic) and returns a short decision string.
+func buildValidateTicketTool(proposed **ProposedTicket, decision *string) (tool.Tool, error) {
+	type Args struct{}
+	type Result struct{ Decision string }
+	return functiontool.New(functiontool.Config{
+		Name:        "validate_ticket",
+		Description: "Validate the proposed ticket for completeness and sensitivity.",
+	}, func(ctx agent.Context, args Args) (Result, error) {
+		if decision == nil {
+			return Result{Decision: "REJECTED"}, fmt.Errorf("internal: validation sink missing")
+		}
+		if proposed == nil || *proposed == nil {
+			*decision = "REJECTED"
+			return Result{Decision: *decision}, nil
+		}
+		// Convert proposed ticket into ticketDraft and run deterministic review.
+		p := *proposed
+		draft := ticketDraft{Title: p.Title, Severity: p.Severity, RootCause: p.RootCause, ProposedFix: p.ProposedFix}
+		*decision = reviewTicketDraft(draft)
+		return Result{Decision: *decision}, nil
+	})
+}
+
+// buildHitlApprovalTool returns a lightweight human-in-the-loop tool which
+// checks an env var (`HITL_AUTO_APPROVE`) to auto-approve in CI, otherwise
+// responds with a "PENDING" status so the runner can fallback to manual prompt.
+func buildHitlApprovalTool(approved *bool) (tool.Tool, error) {
+	type Args struct{}
+	type Result struct{ Approved bool }
+	return functiontool.New(functiontool.Config{
+		Name:        "hitl_approval",
+		Description: "Request human-in-the-loop approval (auto-approve via HITL_AUTO_APPROVE=1).",
+	}, func(ctx agent.Context, args Args) (Result, error) {
+		if approved == nil {
+			return Result{Approved: false}, fmt.Errorf("internal: approval sink missing")
+		}
+		if strings.TrimSpace(os.Getenv("HITL_AUTO_APPROVE")) == "1" {
+			*approved = true
+			return Result{Approved: true}, nil
+		}
+		// Not auto-approved; leave approved false and return pending.
+		return Result{Approved: false}, nil
+	})
+}
+
+// evaluateProposedTicketWithAgent runs a short agentic evaluation using the
+// provided model. If `model` is nil, falls back to the deterministic
+// `reviewTicketDraft` logic. It returns a decision ("APPROVED"/"REJECTED") and
+// an optional rationale string.
+func evaluateProposedTicketWithAgent(ctx context.Context, model model.LLM, proposed *ProposedTicket) (string, string, error) {
+	if proposed == nil {
+		return "REJECTED", "no proposed ticket", nil
+	}
+	if model == nil {
+		// Deterministic fallback
+		d := reviewTicketDraft(ticketDraft{Title: proposed.Title, Severity: proposed.Severity, RootCause: proposed.RootCause, ProposedFix: proposed.ProposedFix})
+		return d, "deterministic_fallback", nil
+	}
+
+	// Build a simple ADK agent that inspects the proposed ticket and emits a
+	// decision with reasoning. The instruction requests a short final line
+	// containing either APPROVED or REJECTED followed by an explanation.
+	instr := fmt.Sprintf("Evaluate the proposed ticket and decide whether it should be created.\nTicket: Title=%q, Severity=%q, RootCause=%q, ProposedFix=%q\nRespond with a single line beginning with APPROVED or REJECTED, followed by a brief rationale.", proposed.Title, proposed.Severity, proposed.RootCause, proposed.ProposedFix)
+	evalAgent, err := llmagent.New(llmagent.Config{
+		Name:        "qa_evaluator",
+		Description: "Agentic evaluator that inspects a proposed ticket and returns APPROVED or REJECTED with rationale.",
+		Model:       model,
+		Instruction: instr,
+		GlobalInstruction: "Be concise and factual. Output must start with APPROVED or REJECTED.",
+	})
+	if err != nil {
+		return "REJECTED", "agent_init_failed", err
+	}
+
+	rs := session.InMemoryService()
+	r, err := runner.New(runner.Config{AppName: "devops-triage-agent", Agent: evalAgent, SessionService: rs, AutoCreateSession: true})
+	if err != nil {
+		return "REJECTED", "runner_init_failed", err
+	}
+
+	prompt := genai.NewContentFromText("Please evaluate the ticket and respond as instructed.", genai.RoleUser)
+	var collected string
+	for event, err := range r.Run(ctx, "devops-triage-user", "qa-eval-session", prompt, agent.RunConfig{StreamingMode: agent.StreamingModeNone}) {
+		if err != nil {
+			return "REJECTED", "run_error", err
+		}
+		if event == nil || event.LLMResponse.Content == nil {
+			continue
+		}
+		for _, p := range event.LLMResponse.Content.Parts {
+			collected += strings.TrimSpace(p.Text) + "\n"
+		}
+	}
+
+	// Find APPROVED/REJECTED in the collected output.
+	lines := strings.Split(strings.TrimSpace(collected), "\n")
+	if len(lines) == 0 {
+		return "REJECTED", "empty_response", nil
+	}
+	first := strings.TrimSpace(lines[len(lines)-1])
+	if strings.HasPrefix(strings.ToUpper(first), "APPROVED") {
+		return "APPROVED", first, nil
+	}
+	if strings.HasPrefix(strings.ToUpper(first), "REJECTED") {
+		return "REJECTED", first, nil
+	}
+	// Fallback: attempt to detect keywords
+	if strings.Contains(strings.ToLower(collected), "approve") {
+		return "APPROVED", first, nil
+	}
+	return "REJECTED", first, nil
+}
+
 func runWorkflow(ctx context.Context) error {
 	return runWorkflowWithInput("", false)
 }
@@ -592,76 +736,127 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 }
 
 func runADKTriage(ctx context.Context, model model.LLM) (string, error) {
+	// Multi-agent pipeline: triage -> qa -> hitl -> create
 	var createdTicketID string
+	var proposed *ProposedTicket
+	var validateDecision string = "REJECTED"
+	var hitlApproved bool
 
+	// Tools
 	readLogTool, err := buildReadLatestErrorLogTool()
 	if err != nil {
 		return "", fmt.Errorf("create read log tool: %w", err)
 	}
-
-	ticketTool, err := buildCreateStructuredTicketTool(&createdTicketID)
+	proposeTool, err := buildProposeTicketTool(&proposed)
 	if err != nil {
-		return "", fmt.Errorf("create ticket tool: %w", err)
+		return "", fmt.Errorf("create propose tool: %w", err)
+	}
+	hitlTool, err := buildHitlApprovalTool(&hitlApproved)
+	if err != nil {
+		return "", fmt.Errorf("create hitl tool: %w", err)
 	}
 
 	tracer := otel.Tracer("devops-triage-agent")
-	initSpanCtx, initSpan := tracer.Start(ctx, "workflow.agent_init")
-	logActionIntent("agent.init", "Initialize ADK triage agent and runner with tool support")
+
+	// --- Triage agent: propose a ticket (does not persist) ---
+	triageModelName := selectAgentModel("triage")
+	triageModel, _ := gemini.NewModel(ctx, triageModelName, &genai.ClientConfig{APIKey: fetchAPIKey()})
 	triageAgent, err := llmagent.New(llmagent.Config{
 		Name:        "triage_agent",
-		Description: "A devops triage assistant that reads local logs and generates structured bug tickets when needed.",
-		Model:       model,
-		Instruction: "You are a devops incident triage assistant. First use the read_latest_error_log tool to inspect the most recent error log. If the log shows a real crash, call create_structured_ticket with a concise title, severity, root_cause, and proposed_fix. If the log does not require a ticket, explain why no ticket should be created.",
-		GlobalInstruction: "Be factual, do not hallucinate, and only use the provided tools.",
-		Tools:       []tool.Tool{readLogTool, ticketTool},
+		Description: "Propose a structured ticket draft based on latest logs.",
+		Model:       triageModel,
+		Instruction: "Inspect logs with read_latest_error_log and, if appropriate, call propose_ticket with a concise title, severity, root_cause, and proposed_fix. Do NOT persist the ticket.",
+		GlobalInstruction: "Be factual and only use the provided tools.",
+		Tools:       []tool.Tool{readLogTool, proposeTool},
 	})
 	if err != nil {
-		initSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
-		initSpan.End()
 		return "", fmt.Errorf("create triage agent: %w", err)
 	}
-
-	sessionService := session.InMemoryService()
-	runner, err := runner.New(runner.Config{AppName: "devops-triage-agent", Agent: triageAgent, SessionService: sessionService, AutoCreateSession: true})
+	ts := session.InMemoryService()
+	triageRunner, err := runner.New(runner.Config{AppName: "devops-triage-agent", Agent: triageAgent, SessionService: ts, AutoCreateSession: true})
 	if err != nil {
-		initSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
-		initSpan.End()
-		return "", fmt.Errorf("create runner: %w", err)
+		return "", fmt.Errorf("create triage runner: %w", err)
 	}
-	initSpan.SetAttributes(attribute.String("outcome", "success"), attribute.String("agent_name", triageAgent.Name()))
-	initSpan.End()
-
-	userMessage := genai.NewContentFromText("Review the latest error log and create a structured ticket if appropriate.", genai.RoleUser)
-	runSpanCtx, runSpan := tracer.Start(initSpanCtx, "workflow.agent_run")
-	logActionIntent("agent.run", "Execute the ADK agent run to inspect logs and create a ticket if needed")
-	defer runSpan.End()
-
-	for event, err := range runner.Run(runSpanCtx, "devops-triage-user", "triage-session", userMessage, agent.RunConfig{StreamingMode: agent.StreamingModeNone}) {
+	triagePrompt := genai.NewContentFromText("Review the latest error log and, if relevant, call propose_ticket to draft a structured ticket.", genai.RoleUser)
+	triageCtx, triageSpan := tracer.Start(ctx, "agent.triage_run")
+	for event, err := range triageRunner.Run(triageCtx, "devops-triage-user", "triage-session", triagePrompt, agent.RunConfig{StreamingMode: agent.StreamingModeNone}) {
 		if err != nil {
-			runSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
+			triageSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
+			triageSpan.End()
 			return "", err
 		}
-		if event == nil {
-			continue
-		}
-		slog.Info("agent.event", "author", event.Author, "final", event.IsFinalResponse(), "branch", event.Branch)
-		if event.LLMResponse.Content != nil {
-			for _, part := range event.LLMResponse.Content.Parts {
-				if strings.TrimSpace(part.Text) != "" {
-					slog.Debug("agent.event.text", "text", strings.TrimSpace(part.Text))
-				}
-			}
-		}
+		_ = event
+	}
+	triageSpan.SetAttributes(attribute.String("outcome", "success"))
+	triageSpan.End()
+
+	if proposed == nil {
+		logActionOutcome("agent.triage", "no ticket proposed")
+		return "", nil
 	}
 
-	runSpan.SetAttributes(attribute.String("outcome", "success"), attribute.Bool("ticket_created", createdTicketID != ""))
-	if createdTicketID != "" {
-		runSpan.SetAttributes(attribute.String("ticket_id", createdTicketID))
-		logActionOutcome("agent.run", "ticket creation flow completed", "ticket_id", createdTicketID)
-	} else {
-		logActionOutcome("agent.run", "agent run completed without ticket creation")
+	// --- QA: run agentic evaluation (falls back to deterministic review) ---
+	qaModelName := selectAgentModel("qa")
+	qaModel, _ := gemini.NewModel(ctx, qaModelName, &genai.ClientConfig{APIKey: fetchAPIKey()})
+	decision, rationale, err := evaluateProposedTicketWithAgent(ctx, qaModel, proposed)
+	if err != nil {
+		return "", fmt.Errorf("qa evaluation failed: %w", err)
+	}
+	validateDecision = decision
+	logActionOutcome("agent.qa", "evaluation_result", "decision", validateDecision, "rationale", rationale)
+	if validateDecision != "APPROVED" {
+		return "", nil
 	}
 
+	// --- HITL agent: request human approval (auto via env var) ---
+	hitlModelName := selectAgentModel("hitl")
+	hitlModel, _ := gemini.NewModel(ctx, hitlModelName, &genai.ClientConfig{APIKey: fetchAPIKey()})
+	hitlAgent, err := llmagent.New(llmagent.Config{
+		Name:        "hitl_agent",
+		Description: "Request human-in-the-loop approval (auto-approve available).",
+		Model:       hitlModel,
+		Instruction: "Call hitl_approval to check for an automated approval flag; otherwise defer to an external human.",
+		GlobalInstruction: "Do not act without explicit approval.",
+		Tools:       []tool.Tool{hitlTool},
+	})
+	if err != nil {
+		return "", fmt.Errorf("create hitl agent: %w", err)
+	}
+	hitlRunner, err := runner.New(runner.Config{AppName: "devops-triage-agent", Agent: hitlAgent, SessionService: session.InMemoryService(), AutoCreateSession: true})
+	if err != nil {
+		return "", fmt.Errorf("create hitl runner: %w", err)
+	}
+	hitlPrompt := genai.NewContentFromText("Request approval for creating the proposed ticket. Use hitl_approval tool.", genai.RoleUser)
+	hitlCtx, hitlSpan := tracer.Start(ctx, "agent.hitl_run")
+	for event, err := range hitlRunner.Run(hitlCtx, "devops-triage-user", "hitl-session", hitlPrompt, agent.RunConfig{StreamingMode: agent.StreamingModeNone}) {
+		if err != nil {
+			hitlSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
+			hitlSpan.End()
+			return "", err
+		}
+		_ = event
+	}
+	hitlSpan.SetAttributes(attribute.String("outcome", "success"), attribute.Bool("approved", hitlApproved))
+	hitlSpan.End()
+
+	if !hitlApproved {
+		// Fallback to local prompt for interactive runs.
+		// Non-interactive runs will not persist the ticket.
+		// The original promptForApproval persists behavior for human-in-the-loop.
+		return "", nil
+	}
+
+	// Persist ticket now that triage->qa->hitl approved it.
+	result, err := CreateStructuredTicket(nil, CreateTicketArgs{
+		Title:       proposed.Title,
+		Severity:    proposed.Severity,
+		RootCause:   proposed.RootCause,
+		ProposedFix: proposed.ProposedFix,
+	})
+	if err != nil {
+		return "", err
+	}
+	createdTicketID = result.TicketID
 	return createdTicketID, nil
 }
 

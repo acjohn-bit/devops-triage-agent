@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -91,5 +92,62 @@ func TestSelectAgentModelHonorsRoleSpecificOverride(t *testing.T) {
 
 	if got := selectAgentModel("qa"); got != "gemini-2.5-pro" {
 		t.Fatalf("expected QA model override to be used, got %q", got)
+	}
+}
+
+func TestAgenticValidationFallback(t *testing.T) {
+	// When no model is provided, agentic evaluator should fall back to deterministic review.
+	proposed := &ProposedTicket{Title: "DB failure", Severity: "HIGH", RootCause: "database down", ProposedFix: "restart DB"}
+	decision, rationale, err := evaluateProposedTicketWithAgent(context.Background(), nil, proposed)
+	if err != nil {
+		t.Fatalf("evaluator error: %v", err)
+	}
+	if decision != "APPROVED" && decision != "REJECTED" {
+		t.Fatalf("unexpected decision: %q (rationale: %s)", decision, rationale)
+	}
+}
+
+func TestIntegrationFlowAutoApprove(t *testing.T) {
+	tmpDir := t.TempDir()
+	originalLogsDir := defaultLogsDirValue
+	originalTicketsDir := defaultTicketsDirValue
+	originalStateDB := defaultStateDBValue
+	defer func() {
+		defaultLogsDirValue = originalLogsDir
+		defaultTicketsDirValue = originalTicketsDir
+		defaultStateDBValue = originalStateDB
+		_ = os.Unsetenv("HITL_AUTO_APPROVE")
+	}()
+
+	defaultLogsDirValue = filepath.Join(tmpDir, "logs")
+	defaultTicketsDirValue = filepath.Join(tmpDir, "tickets")
+	defaultStateDBValue = filepath.Join(tmpDir, "state", "workflow_state.sqlite")
+
+	if err := os.MkdirAll(defaultLogsDirValue, 0o755); err != nil {
+		t.Fatalf("create logs dir: %v", err)
+	}
+	if err := os.MkdirAll(defaultTicketsDirValue, 0o755); err != nil {
+		t.Fatalf("create tickets dir: %v", err)
+	}
+
+	logContent := "2026-07-07T12:00:00Z ERROR database connection failed for user@example.com"
+	if err := os.WriteFile(filepath.Join(defaultLogsDirValue, "crash_001.log"), []byte(logContent), 0o644); err != nil {
+		t.Fatalf("write sample log: %v", err)
+	}
+
+	if err := os.Setenv("HITL_AUTO_APPROVE", "1"); err != nil {
+		t.Fatalf("set env: %v", err)
+	}
+
+	if err := runWorkflowWithInput("", true); err != nil {
+		t.Fatalf("run workflow: %v", err)
+	}
+
+	files, err := os.ReadDir(defaultTicketsDirValue)
+	if err != nil {
+		t.Fatalf("read tickets dir: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatalf("expected a ticket to be written")
 	}
 }
