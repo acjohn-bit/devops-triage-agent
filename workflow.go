@@ -17,6 +17,7 @@ import (
 	"cloud.google.com/go/secretmanager/apiv1"
 	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
 	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
@@ -201,6 +202,14 @@ func newTraceID() string {
 	return fmt.Sprintf("trace-%d", time.Now().UnixNano())
 }
 
+func logActionIntent(action, description string, attrs ...any) {
+	slog.Info("workflow.intent", append([]any{"action", action, "description", description}, attrs...)...)
+}
+
+func logActionOutcome(action, outcome string, attrs ...any) {
+	slog.Info("workflow.outcome", append([]any{"action", action, "outcome", outcome}, attrs...)...)
+}
+
 func fetchAPIKey() string {
 	for _, key := range []string{"GEMINI_API_KEY", "GOOGLE_API_KEY"} {
 		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
@@ -358,6 +367,12 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 		return fmt.Errorf("load workflow state: %w", err)
 	}
 
+	tracer := otel.Tracer("devops-triage-agent")
+	ctx, workflowSpan := tracer.Start(ctx, "workflow.start")
+	workflowSpan.SetAttributes(attribute.String("workflow.trace_id", state.TraceID))
+	defer workflowSpan.End()
+	logActionIntent("workflow.start", "Begin workflow execution", "trace_id", state.TraceID)
+
 	if err := os.MkdirAll(defaultLogsDirValue, 0o755); err != nil {
 		return fmt.Errorf("create logs directory: %w", err)
 	}
@@ -371,6 +386,7 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 
 	slog.Info("workflow.start", "trace_id", state.TraceID, "history_len", len(state.History), "mode", "deterministic")
 	state.appendHistory("workflow started")
+	logActionOutcome("workflow.start", "workflow initialized", "history_length", len(state.History))
 	_ = ctx
 
 	if apiKey := fetchAPIKey(); apiKey != "" {
@@ -394,14 +410,34 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 		slog.Warn("agent.model.init_skipped", "reason", "GEMINI_API_KEY not configured; using deterministic local workflow")
 	}
 
+	logSpanCtx, logSpan := tracer.Start(ctx, "workflow.log_ingestion")
+	logActionIntent("log.ingestion", "Read and ingest latest error log")
+	if err := seedSampleLog(defaultLogsDirValue); err != nil {
+		logSpan.SetAttributes(attribute.String("error", err.Error()))
+		logSpan.End()
+		return fmt.Errorf("seed sample log: %w", err)
+	}
+
 	logContent, err := readLatestLogFile(defaultLogsDirValue)
+	if err != nil {
+		logSpan.SetAttributes(attribute.String("error", err.Error()))
+		logSpan.End()
+		return fmt.Errorf("read latest log: %w", err)
+	}
+	logSpan.SetAttributes(attribute.Int("log_length_bytes", len(logContent)))
+	logActionOutcome("log.ingestion", "log loaded", "log_size", len(logContent))
+	logSpan.End()
 	if err != nil {
 		return fmt.Errorf("read latest log: %w", err)
 	}
 
+	spanCtx, draftSpan := tracer.Start(logSpanCtx, "workflow.ticket_draft")
+	logActionIntent("ticket.draft", "Generate a ticket draft from ingested log content", "severity_hint", inferSeverity(logContent))
 	draft := buildTicketDraft(logContent)
 	slog.Info("agent.execution", "agent", "triage", "action", "draft_ticket", "severity", draft.Severity, "title", draft.Title)
 	state.appendHistory(fmt.Sprintf("drafted ticket %q", draft.Title))
+	logActionOutcome("ticket.draft", "draft created", "severity", draft.Severity, "title", draft.Title)
+	draftSpan.End()
 	if _, err := os.Stat(defaultStateDB); err == nil {
 		store, err := openStateStore(defaultStateDB)
 		if err == nil {
@@ -412,15 +448,21 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 		}
 	}
 
+	_, validationSpan := tracer.Start(spanCtx, "workflow.ticket_validation")
+	logActionIntent("ticket.validation", "Validate the drafted ticket for completeness and sensitivity")
 	reviewResult := reviewTicketDraft(draft)
 	slog.Info("agent.execution", "agent", "qa", "action", "validate_ticket", "decision", reviewResult, "trace_id", state.TraceID)
 	if reviewResult != "APPROVED" {
+		validationSpan.SetAttributes(attribute.String("validation_result", reviewResult))
+		validationSpan.End()
 		state.appendHistory("qa rejected ticket draft")
 		if saveErr := state.save(defaultStatePathValue); saveErr != nil {
 			return fmt.Errorf("save workflow state: %w", saveErr)
 		}
 		return nil
 	}
+	validationSpan.SetAttributes(attribute.String("validation_result", reviewResult))
+	validationSpan.End()
 
 	approval := promptForApproval(input, nonInteractive)
 	if !approval {
@@ -431,6 +473,9 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 		return nil
 	}
 
+	_, creationSpan := tracer.Start(ctx, "workflow.ticket_creation")
+	defer creationSpan.End()
+	logActionIntent("ticket.creation", "Create the approved ticket in the ticket store", "title", draft.Title, "severity", draft.Severity)
 	result, err := CreateStructuredTicket(nil, CreateTicketArgs{
 		Title:       draft.Title,
 		Severity:    draft.Severity,
@@ -438,15 +483,19 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 		ProposedFix: draft.ProposedFix,
 	})
 	if err != nil {
+		creationSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
 		return err
 	}
 
 	state.LastTicketID = result.TicketID
 	state.appendHistory(fmt.Sprintf("created ticket %s", result.TicketID))
 	if saveErr := state.save(defaultStatePathValue); saveErr != nil {
+		creationSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", saveErr.Error()))
 		return fmt.Errorf("save workflow state: %w", saveErr)
 	}
 
+	creationSpan.SetAttributes(attribute.String("outcome", "success"), attribute.String("ticket_id", result.TicketID), attribute.String("ticket_status", result.Status))
+	logActionOutcome("ticket.creation", "ticket created", "ticket_id", result.TicketID, "status", result.Status)
 	slog.Info("workflow.complete", "trace_id", state.TraceID, "ticket_id", result.TicketID, "status", result.Status)
 	return nil
 }
@@ -476,6 +525,9 @@ func runADKTriage(ctx context.Context, model model.LLM) (string, error) {
 		return "", fmt.Errorf("create ticket tool: %w", err)
 	}
 
+	tracer := otel.Tracer("devops-triage-agent")
+	initSpanCtx, initSpan := tracer.Start(ctx, "workflow.agent_init")
+	logActionIntent("agent.init", "Initialize ADK triage agent and runner with tool support")
 	triageAgent, err := llmagent.New(llmagent.Config{
 		Name:        "triage_agent",
 		Description: "A devops triage assistant that reads local logs and generates structured bug tickets when needed.",
@@ -485,18 +537,29 @@ func runADKTriage(ctx context.Context, model model.LLM) (string, error) {
 		Tools:       []tool.Tool{readLogTool, ticketTool},
 	})
 	if err != nil {
+		initSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
+		initSpan.End()
 		return "", fmt.Errorf("create triage agent: %w", err)
 	}
 
 	sessionService := session.InMemoryService()
 	runner, err := runner.New(runner.Config{AppName: "devops-triage-agent", Agent: triageAgent, SessionService: sessionService, AutoCreateSession: true})
 	if err != nil {
+		initSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
+		initSpan.End()
 		return "", fmt.Errorf("create runner: %w", err)
 	}
+	initSpan.SetAttributes(attribute.String("outcome", "success"), attribute.String("agent_name", triageAgent.Name()))
+	initSpan.End()
 
 	userMessage := genai.NewContentFromText("Review the latest error log and create a structured ticket if appropriate.", genai.RoleUser)
-	for event, err := range runner.Run(ctx, "devops-triage-user", "triage-session", userMessage, agent.RunConfig{StreamingMode: agent.StreamingModeNone}) {
+	runSpanCtx, runSpan := tracer.Start(initSpanCtx, "workflow.agent_run")
+	logActionIntent("agent.run", "Execute the ADK agent run to inspect logs and create a ticket if needed")
+	defer runSpan.End()
+
+	for event, err := range runner.Run(runSpanCtx, "devops-triage-user", "triage-session", userMessage, agent.RunConfig{StreamingMode: agent.StreamingModeNone}) {
 		if err != nil {
+			runSpan.SetAttributes(attribute.String("outcome", "error"), attribute.String("error", err.Error()))
 			return "", err
 		}
 		if event == nil {
@@ -510,6 +573,14 @@ func runADKTriage(ctx context.Context, model model.LLM) (string, error) {
 				}
 			}
 		}
+	}
+
+	runSpan.SetAttributes(attribute.String("outcome", "success"), attribute.Bool("ticket_created", createdTicketID != ""))
+	if createdTicketID != "" {
+		runSpan.SetAttributes(attribute.String("ticket_id", createdTicketID))
+		logActionOutcome("agent.run", "ticket creation flow completed", "ticket_id", createdTicketID)
+	} else {
+		logActionOutcome("agent.run", "agent run completed without ticket creation")
 	}
 
 	return createdTicketID, nil
