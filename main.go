@@ -16,7 +16,7 @@ import (
 )
 
 // ==========================================
-// 1. TOOL & INTERFACE DESIGN CRITERIA
+// 1. TOOL & INTERFACE DEFINITIONS
 // Statically typed structs with `jsonschema` tags guarantee Gemini outputs perfectly formatted parameters.
 // ==========================================
 
@@ -136,7 +136,7 @@ panic: runtime error: invalid memory address or nil pointer dereference`
 		Description: "Generates a structured engineering ticket inside the /tickets directory.",
 	}, CreateStructuredTicket)
 	
-	instructions := `You are responsible for triaging server crash logs and creating structured engineering tickets.
+	baseInstructions := `You are responsible for triaging server crash logs and creating structured engineering tickets.
 					Your job is to process raw server crash logs, isolate the precise root cause, and output a structured ticket for human developers.
 					Always call "read_latest_error_log" first to pull the data. Analyze it deeply, then call "create_structured_ticket" with your final analysis.`
 
@@ -144,12 +144,30 @@ panic: runtime error: invalid memory address or nil pointer dereference`
 	agent, err := llmagent.New(llmagent.Config{
 		Name:  "DevOpsTriageAgent",
 		Model: model,
-		Instruction: instructions,
+		Instruction: baseInstructions,
 		Tools: []tool.Tool{readLogTool, createTicketTool},
 	})
 	if err != nil {
 		log.Fatalf("Failed to init agent: %v", err)
 	}
+
+	qaInstructions := `You are a QA agent that reviews structured engineering tickets for accuracy and completeness.`
+
+	qaAgent, _ := llmagent.New(llmagent.Config{
+		Name:  "TicketQAAgent",
+		Model: model,
+		Instruction: qaInstructions,
+		Tools: []tool.Tool{createTicketTool},
+	})
+
+	fmt.Print("\n[Human-in-the-Loop] Agent proposes creating a ticket. Approve? (Y/N): ")
+	reader := bufio.NewReader(os.Stdin)
+	approval, _ := reader.ReadString('\n')
+	if approval != "Y\n" && approval != "y\n" {
+		log.Println("Ticket creation aborted by human operator.")
+		return
+	}
+	log.Println("Human operator approved ticket creation.")
 
 	// ADK Go native multi-turn execution (simplistic simulated runner for local PoC)
 	// In production, this agent would be attached to a Web / RPC server or the ADK Launcher.
