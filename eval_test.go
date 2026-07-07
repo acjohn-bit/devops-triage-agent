@@ -1,6 +1,7 @@
 package main
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -71,5 +72,24 @@ func TestStateStorePersistsHistory(t *testing.T) {
 func TestPromptForApprovalSupportsNonInteractiveInput(t *testing.T) {
 	if !promptForApproval("y", true) {
 		t.Fatal("expected non-interactive approval to succeed")
+	}
+}
+
+func TestSelectAgentModelHonorsRoleSpecificOverride(t *testing.T) {
+	original := os.Getenv("GEMINI_QA_MODEL")
+	t.Cleanup(func() {
+		if original == "" {
+			_ = os.Unsetenv("GEMINI_QA_MODEL")
+		} else {
+			_ = os.Setenv("GEMINI_QA_MODEL", original)
+		}
+	})
+
+	if err := os.Setenv("GEMINI_QA_MODEL", "gemini-2.5-pro"); err != nil {
+		t.Fatalf("set env: %v", err)
+	}
+
+	if got := selectAgentModel("qa"); got != "gemini-2.5-pro" {
+		t.Fatalf("expected QA model override to be used, got %q", got)
 	}
 }

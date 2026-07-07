@@ -260,6 +260,34 @@ func fetchAPIKey() string {
 	return ""
 }
 
+func selectAgentModel(role string) string {
+	role = strings.ToLower(strings.TrimSpace(role))
+	if role == "" {
+		role = "triage"
+	}
+
+	var envVar string
+	switch role {
+	case "qa", "review", "validator":
+		envVar = "GEMINI_QA_MODEL"
+	case "hitl", "human", "approval":
+		envVar = "GEMINI_HITL_MODEL"
+	default:
+		envVar = "GEMINI_TRIAGE_MODEL"
+	}
+
+	if value := strings.TrimSpace(os.Getenv(envVar)); value != "" {
+		return value
+	}
+
+	defaults := map[string]string{
+		"triage": "gemini-2.5-flash",
+		"qa":     "gemini-2.5-flash",
+		"hitl":   "gemini-2.5-flash",
+	}
+	return defaults[role]
+}
+
 func fetchSecretFromGCP(projectID, secretName string) (string, error) {
 	ctx := context.Background()
 	client, err := secretmanager.NewClient(ctx)
@@ -469,7 +497,8 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 	_ = ctx
 
 	if apiKey := fetchAPIKey(); apiKey != "" {
-		model, modelErr := gemini.NewModel(ctx, "gemini-2.5-flash", &genai.ClientConfig{APIKey: apiKey})
+		triageModelName := selectAgentModel("triage")
+		model, modelErr := gemini.NewModel(ctx, triageModelName, &genai.ClientConfig{APIKey: apiKey})
 		if modelErr != nil {
 			slog.Warn("agent.model.init_failed", "error", modelErr)
 		} else {
