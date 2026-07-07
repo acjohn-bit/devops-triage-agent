@@ -21,15 +21,15 @@ func TestGoldenWorkflowProducesTicket(t *testing.T) {
 	defaultTicketsDirValue = filepath.Join(tmpDir, "tickets")
 	defaultStatePathValue = filepath.Join(tmpDir, "state", "workflow_state.json")
 
-	if err := os.MkdirAll(defaultLogsDir, 0o755); err != nil {
+	if err := os.MkdirAll(defaultLogsDirValue, 0o755); err != nil {
 		t.Fatalf("create logs dir: %v", err)
 	}
-	if err := os.MkdirAll(defaultTicketsDir, 0o755); err != nil {
+	if err := os.MkdirAll(defaultTicketsDirValue, 0o755); err != nil {
 		t.Fatalf("create tickets dir: %v", err)
 	}
 
 	logContent := "2026-07-07T12:00:00Z ERROR database connection failed for user@example.com"
-	if err := os.WriteFile(filepath.Join(defaultLogsDir, "crash_001.log"), []byte(logContent), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(defaultLogsDirValue, "crash_001.log"), []byte(logContent), 0o644); err != nil {
 		t.Fatalf("write sample log: %v", err)
 	}
 
@@ -37,7 +37,7 @@ func TestGoldenWorkflowProducesTicket(t *testing.T) {
 		t.Fatalf("run workflow: %v", err)
 	}
 
-	files, err := os.ReadDir(defaultTicketsDir)
+	files, err := os.ReadDir(defaultTicketsDirValue)
 	if err != nil {
 		t.Fatalf("read tickets dir: %v", err)
 	}

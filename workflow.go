@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,14 @@ import (
 	"strings"
 	"time"
 
+	_ "modernc.org/sqlite"
+	"cloud.google.com/go/secretmanager/apiv1"
+	secretmanagerpb "google.golang.org/genproto/googleapis/cloud/secretmanager/v1"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/exporters/stdout/stdouttrace"
+	"go.opentelemetry.io/otel/sdk/resource"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 	"google.golang.org/adk/v2/agent"
 	"google.golang.org/adk/v2/agent/llmagent"
 	"google.golang.org/adk/v2/model/gemini"
@@ -23,6 +32,7 @@ const (
 	defaultLogsDir   = "./logs"
 	defaultTicketsDir = "./tickets"
 	defaultStatePath = "./state/workflow_state.json"
+	defaultStateDB   = "./state/workflow_state.sqlite"
 )
 
 var (
@@ -35,9 +45,63 @@ var emailPattern = regexp.MustCompile(`(?i)\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2
 var secretPattern = regexp.MustCompile(`(?i)\b(?:password|token|api[_-]?key)[\s:=]+[A-Za-z0-9._-]{3,}`)
 
 type workflowState struct {
-	TraceID     string   `json:"trace_id"`
-	History     []string `json:"history"`
-	LastTicketID string  `json:"last_ticket_id,omitempty"`
+	TraceID      string   `json:"trace_id"`
+	History      []string `json:"history"`
+	LastTicketID string   `json:"last_ticket_id,omitempty"`
+}
+
+type stateStore struct {
+	db *sql.DB
+}
+
+func openStateStore(path string) (*stateStore, error) {
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS workflow_state (trace_id TEXT PRIMARY KEY, history TEXT, last_ticket_id TEXT)`); err != nil {
+		db.Close()
+		return nil, err
+	}
+	return &stateStore{db: db}, nil
+}
+
+func (s *stateStore) close() error {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Close()
+}
+
+func (s *stateStore) saveState(state *workflowState) error {
+	if s == nil || s.db == nil || state == nil {
+		return nil
+	}
+	historyJSON, err := json.Marshal(state.History)
+	if err != nil {
+		return err
+	}
+	_, err = s.db.Exec(`INSERT INTO workflow_state(trace_id, history, last_ticket_id) VALUES(?, ?, ?) ON CONFLICT(trace_id) DO UPDATE SET history=excluded.history, last_ticket_id=excluded.last_ticket_id`, state.TraceID, string(historyJSON), state.LastTicketID)
+	return err
+}
+
+func (s *stateStore) loadState() (*workflowState, error) {
+	if s == nil || s.db == nil {
+		return newWorkflowState(), nil
+	}
+	var traceID, historyJSON, lastTicketID string
+	err := s.db.QueryRow(`SELECT trace_id, history, last_ticket_id FROM workflow_state ORDER BY trace_id DESC LIMIT 1`).Scan(&traceID, &historyJSON, &lastTicketID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return newWorkflowState(), nil
+		}
+		return nil, err
+	}
+	var history []string
+	if err := json.Unmarshal([]byte(historyJSON), &history); err != nil {
+		return nil, err
+	}
+	return &workflowState{TraceID: traceID, History: history, LastTicketID: lastTicketID}, nil
 }
 
 type ticketDraft struct {
@@ -142,6 +206,42 @@ func fetchAPIKey() string {
 	return ""
 }
 
+func fetchSecretFromGCP(projectID, secretName string) (string, error) {
+	ctx := context.Background()
+	client, err := secretmanager.NewClient(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer client.Close()
+	resp, err := client.AccessSecretVersion(ctx, &secretmanagerpb.AccessSecretVersionRequest{
+		Name: fmt.Sprintf("projects/%s/secrets/%s/versions/latest", projectID, secretName),
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(resp.GetPayload().GetData()), nil
+}
+
+func initTracing() (*sdktrace.TracerProvider, error) {
+	exporter, err := stdouttrace.New(stdouttrace.WithWriter(os.Stdout))
+	if err != nil {
+		return nil, err
+	}
+	res, err := resource.Merge(resource.Default(), resource.NewWithAttributes(
+		semconv.SchemaURL,
+		semconv.ServiceNameKey.String("devops-triage-agent"),
+	))
+	if err != nil {
+		return nil, err
+	}
+	provider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithResource(res),
+	)
+	otel.SetTracerProvider(provider)
+	return provider, nil
+}
+
 func redactPII(input string) string {
 	sanitized := emailPattern.ReplaceAllString(input, "[REDACTED_EMAIL]")
 	sanitized = secretPattern.ReplaceAllString(sanitized, "[REDACTED_SECRET]")
@@ -242,6 +342,13 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(logger)
 
+	tracerProvider, err := initTracing()
+	if err != nil {
+		slog.Warn("tracing.init_failed", "error", err)
+	} else {
+		defer tracerProvider.Shutdown(ctx)
+	}
+
 	state, err := loadWorkflowState(defaultStatePathValue)
 	if err != nil {
 		return fmt.Errorf("load workflow state: %w", err)
@@ -260,6 +367,7 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 
 	slog.Info("workflow.start", "trace_id", state.TraceID, "history_len", len(state.History), "mode", "deterministic")
 	state.appendHistory("workflow started")
+	_ = ctx
 
 	if apiKey := fetchAPIKey(); apiKey != "" {
 		if _, modelErr := gemini.NewModel(ctx, "gemini-2.5-flash", nil); modelErr != nil {
@@ -281,6 +389,15 @@ func runWorkflowWithInputContext(ctx context.Context, input string, nonInteracti
 	draft := buildTicketDraft(logContent)
 	slog.Info("agent.execution", "agent", "triage", "action", "draft_ticket", "severity", draft.Severity, "title", draft.Title)
 	state.appendHistory(fmt.Sprintf("drafted ticket %q", draft.Title))
+	if _, err := os.Stat(defaultStateDB); err == nil {
+		store, err := openStateStore(defaultStateDB)
+		if err == nil {
+			if saveErr := store.saveState(state); saveErr != nil {
+				slog.Warn("workflow.state.persist_failed", "error", saveErr)
+			}
+			_ = store.close()
+		}
+	}
 
 	reviewResult := reviewTicketDraft(draft)
 	slog.Info("agent.execution", "agent", "qa", "action", "validate_ticket", "decision", reviewResult, "trace_id", state.TraceID)
