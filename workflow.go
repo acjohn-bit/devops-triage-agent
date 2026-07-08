@@ -53,8 +53,6 @@ type ProposedTicket struct {
     ProposedFix string `json:"proposed_fix"`
 }
 
-    
-
 func logActionIntent(action, description string, attrs ...any) {
     slog.Info("workflow.intent", append([]any{"action", action, "description", description}, attrs...)...)
 }
@@ -70,34 +68,6 @@ func fetchAPIKey() string {
         }
     }
     return ""
-}
-
-func selectAgentModel(role string) string {
-    role = strings.ToLower(strings.TrimSpace(role))
-    if role == "" {
-        role = "triage"
-    }
-
-    var envVar string
-    switch role {
-    case "qa", "review", "validator":
-        envVar = "GEMINI_QA_MODEL"
-    case "hitl", "human", "approval":
-        envVar = "GEMINI_HITL_MODEL"
-    default:
-        envVar = "GEMINI_TRIAGE_MODEL"
-    }
-
-    if value := strings.TrimSpace(os.Getenv(envVar)); value != "" {
-        return value
-    }
-
-    defaults := map[string]string{
-        "triage": "gemini-2.5-flash",
-        "qa":     "gemini-2.5-flash",
-        "hitl":   "gemini-2.5-flash",
-    }
-    return defaults[role]
 }
 
 func fetchSecretFromGCP(projectID, secretName string) (string, error) {
@@ -123,12 +93,6 @@ func initTracing() (*sdktrace.TracerProvider, error) {
     )
     otel.SetTracerProvider(provider)
     return provider, nil
-}
-
-func redactPII(input string) string {
-    sanitized := emailPattern.ReplaceAllString(input, "[REDACTED_EMAIL]")
-    sanitized = secretPattern.ReplaceAllString(sanitized, "[REDACTED_SECRET]")
-    return strings.ReplaceAll(sanitized, "user@example.com", "[REDACTED_EMAIL]")
 }
 
 func inferSeverity(logContent string) string {
